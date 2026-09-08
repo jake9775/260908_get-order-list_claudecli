@@ -1,0 +1,14 @@
+# 구글 인증 정보 - 개인 계정 접근 권한이 담겨있어 절대 커밋하면 안 됨
+credentials.json
+token.json
+client_secret*.json
+
+# 결제 내역이 담긴 결과물 - 개인정보이므로 커밋하지 않음
+output/*.csv
+
+# 파이썬 캐시
+__pycache__/
+*.pyc
+
+# Claude Code(oh-my-claudecode) 내부 세션/작업 상태 - 프로젝트 코드와 무관
+.omc/
