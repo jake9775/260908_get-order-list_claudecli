@@ -2,8 +2,22 @@
 """
 쿠팡이츠 월별 결제 내역 CSV 자동화
 
-내가 지정한 연/월에 대해, Gmail로 온 쿠팡이츠 결제 안내 메일
-("NHN KCP - 쿠팡이츠의 결제 내역입니다")을 찾아서 CSV 파일로 정리한다.
+내가 지정한 연/월에 대해, Gmail로 온 쿠팡이츠 결제 안내 메일을 찾아서
+CSV 파일로 정리한다. 쿠팡이츠 결제는 아래 3곳의 PG(결제 대행)사 중 한
+곳을 통해 메일이 온다.
+
+  1. NHN KCP        (pgadmcust@kcp.co.kr)
+     - 메일 본문의 "구매상점명"이 '쿠팡이츠' 또는 '쿠팡이츠(레거시)'인 것
+  2. 나이스페이먼츠  (nice_customer@nicepg.co.kr)
+     - 메일 본문의 "주문번호"가 'ROCKET_PAY_DELIVERY_'로 시작하는 것
+  3. 이지페이(KICC)  (easypay_noreturn@easypay.co.kr)
+     - 메일에 담긴 "English Receipt" 페이지의 주문번호가
+       'ROCKET_PAY_DELIVERY_'로 시작하는 것
+
+이 프로그램은 내 Gmail 계정에서만(읽기 전용) 메일을 읽어오고, 이지페이의
+경우 메일 속 영수증 페이지를 열어 주문번호만 추가로 확인한다. 확인한
+내용은 모두 이 컴퓨터 안에서만 처리되며, 결과는 output 폴더의 CSV
+파일로만 저장된다. 외부로 전송되거나 별도로 저장되지 않는다.
 
 사용법:
     run.bat 을 더블클릭하거나, 터미널에서 `python coupang_eats_csv.py` 실행
@@ -17,6 +31,7 @@ import re
 import sys
 from datetime import datetime, timedelta
 
+import requests
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -31,11 +46,25 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 # 지메일 읽기 전용 권한만 요청 (메일 삭제/발송 등은 하지 않음)
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
-# 쿠팡이츠 결제 안내 메일에서 뽑아낼 항목 (메일 본문에 나오는 라벨 그대로)
-FIELDS = ["결제일시", "결제금액", "카드종류", "승인번호", "주문번호", "주문상품명"]
-
 # CSV에 실제로 저장할 컬럼 순서
-CSV_COLUMNS = ["결제일시", "상품명", "결제금액", "카드종류", "주문번호", "승인번호"]
+CSV_COLUMNS = ["결제일시", "PG사", "상점명", "상품명", "결제금액", "주문번호", "승인번호"]
+
+# 쿠팡이츠 결제가 오는 3곳의 PG사 메일 발신자 주소
+KCP_SENDER = "pgadmcust@kcp.co.kr"
+NICEPG_SENDER = "nice_customer@nicepg.co.kr"
+EASYPAY_SENDER = "easypay_noreturn@easypay.co.kr"
+
+PG_NAME = {
+    "kcp": "NHN KCP",
+    "nicepg": "나이스페이먼츠",
+    "easypay": "이지페이",
+}
+
+# 쿠팡이츠 주문번호는 항상 이 문자열로 시작한다 (나이스페이먼츠 / 이지페이 판별 기준)
+DELIVERY_ORDER_PREFIX = "ROCKET_PAY_DELIVERY_"
+
+# 이지페이 영수증 페이지 요청 시 사용할 타임아웃(초)
+EASYPAY_RECEIPT_TIMEOUT = 15
 
 
 # --- 1. 구글 로그인 / 인증 ------------------------------------------------
@@ -93,12 +122,15 @@ def month_range(year, month):
     return start, end
 
 
-def build_query(start, end):
+def build_query(sender, start, end, extra=""):
     # 시간대 경계에서 메일이 하루 밀리는 경우를 대비해 앞뒤로 하루씩 여유를 두고 검색한다.
     # 실제 대상 월인지는 메일 본문의 결제일시를 파싱해 다시 한번 정확히 걸러낸다.
     q_start = (start - timedelta(days=1)).strftime("%Y/%m/%d")
     q_end = (end + timedelta(days=1)).strftime("%Y/%m/%d")
-    return f"from:pgadmcust@kcp.co.kr subject:쿠팡이츠 after:{q_start} before:{q_end}"
+    query = f"from:{sender} after:{q_start} before:{q_end}"
+    if extra:
+        query += f" {extra}"
+    return query
 
 
 def list_message_ids(service, query):
@@ -149,8 +181,9 @@ def get_message_body(service, msg_id):
 
 # --- 4. 메일 본문에서 항목 추출 -------------------------------------------
 def extract_field(body, label):
-    """<td>라벨</td><td>값</td> 형태의 표에서 라벨 바로 다음 칸의 값을 뽑아낸다."""
-    pattern = re.compile(rf">{re.escape(label)}</td>\s*<td[^>]*>(.*?)</td>", re.DOTALL)
+    """<td>라벨</td><td>값</td> (또는 <th>라벨</th><td>값</td>) 형태의 표에서
+    라벨 바로 다음 칸의 값을 뽑아낸다."""
+    pattern = re.compile(rf">{re.escape(label)}</t[dh]>\s*<td[^>]*>(.*?)</td>", re.DOTALL)
     m = pattern.search(body)
     if not m:
         return ""
@@ -160,47 +193,182 @@ def extract_field(body, label):
 
 
 def parse_payment_datetime(text):
-    m = re.search(r"(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일\s*(\d{1,2})시\s*(\d{1,2})분", text)
-    if not m:
-        return None
-    y, mo, d, h, mi = (int(x) for x in m.groups())
-    try:
-        return datetime(y, mo, d, h, mi)
-    except ValueError:
-        return None
+    """PG사마다 결제일시 표기 형식이 달라서 여러 형식을 순서대로 시도한다."""
+    patterns = [
+        r"(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일\s*(\d{1,2})시\s*(\d{1,2})분",  # KCP
+        r"(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{1,2}):(\d{1,2})",  # 나이스페이먼츠
+        r"(\d{4})/(\d{1,2})/(\d{1,2})\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?",  # 이지페이
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text)
+        if not m:
+            continue
+        parts = [int(g) if g else 0 for g in m.groups()]
+        while len(parts) < 6:
+            parts.append(0)
+        y, mo, d, h, mi, s = parts[:6]
+        try:
+            return datetime(y, mo, d, h, mi, s)
+        except ValueError:
+            continue
+    return None
 
 
-def parse_message(service, msg_id, target_year, target_month, warn):
-    body = get_message_body(service, msg_id)
-    if not body:
-        warn(f"메일(id={msg_id})의 내용을 읽을 수 없어 건너뜁니다.")
-        return None
+def clean_amount(text):
+    """'14,900 원', '32,200 원 (일시불)', '21,900원' 등을 '14,900원' 형태로 통일한다."""
+    m = re.search(r"([\d][\d,]*)\s*원", text)
+    if m:
+        return f"{m.group(1)}원"
+    return text.strip()
 
-    values = {label: extract_field(body, label) for label in FIELDS}
+
+# --- 4-1. NHN KCP 메일 파싱 ------------------------------------------------
+KCP_FIELDS = ["결제일시", "결제금액", "승인번호", "주문번호", "구매상점명", "주문상품명"]
+KCP_STORE_NAMES = {"쿠팡이츠", "쿠팡이츠(레거시)"}
+
+
+def parse_kcp_message(body, msg_id, target_year, target_month, warn):
+    values = {label: extract_field(body, label) for label in KCP_FIELDS}
 
     dt = parse_payment_datetime(values["결제일시"])
     if dt is None:
-        warn(
-            f"메일(id={msg_id})에서 결제일시를 해석하지 못해 건너뜁니다. "
-            "(쿠팡/KCP 메일 형식이 바뀌었을 수 있습니다)"
-        )
+        warn(f"[KCP] 메일(id={msg_id})에서 결제일시를 해석하지 못해 건너뜁니다.")
+        return None
+    if not (dt.year == target_year and dt.month == target_month):
         return None
 
-    if not (dt.year == target_year and dt.month == target_month):
-        # 검색 시 하루씩 여유를 뒀기 때문에, 대상 월이 아닌 메일은 조용히 제외한다.
+    if values["구매상점명"] not in KCP_STORE_NAMES:
+        # 쿠팡이츠가 아닌 다른 KCP 결제 메일 (해당사항 없음, 조용히 제외)
         return None
 
     if not values["결제금액"]:
-        warn(f"메일(id={msg_id})에서 결제금액을 찾지 못해 건너뜁니다.")
+        warn(f"[KCP] 메일(id={msg_id})에서 결제금액을 찾지 못해 건너뜁니다.")
         return None
 
     return {
         "_dt": dt,
         "결제일시": values["결제일시"],
+        "PG사": PG_NAME["kcp"],
+        "상점명": values["구매상점명"],
         "상품명": values["주문상품명"],
-        "결제금액": values["결제금액"],
-        "카드종류": values["카드종류"],
+        "결제금액": clean_amount(values["결제금액"]),
         "주문번호": values["주문번호"],
+        "승인번호": values["승인번호"],
+    }
+
+
+# --- 4-2. 나이스페이먼츠 메일 파싱 -----------------------------------------
+NICEPG_FIELDS = ["결제일시", "결제금액", "승인번호", "주문번호", "상점명", "상품명"]
+
+
+def parse_nicepg_message(body, msg_id, target_year, target_month, warn):
+    values = {label: extract_field(body, label) for label in NICEPG_FIELDS}
+
+    dt = parse_payment_datetime(values["결제일시"])
+    if dt is None:
+        warn(f"[나이스페이먼츠] 메일(id={msg_id})에서 결제일시를 해석하지 못해 건너뜁니다.")
+        return None
+    if not (dt.year == target_year and dt.month == target_month):
+        return None
+
+    if not values["주문번호"].startswith(DELIVERY_ORDER_PREFIX):
+        # 쿠팡 로켓배송 등 다른 주문 (쿠팡이츠 아님, 조용히 제외)
+        return None
+
+    if not values["결제금액"]:
+        warn(f"[나이스페이먼츠] 메일(id={msg_id})에서 결제금액을 찾지 못해 건너뜁니다.")
+        return None
+
+    return {
+        "_dt": dt,
+        "결제일시": values["결제일시"],
+        "PG사": PG_NAME["nicepg"],
+        "상점명": values["상점명"],
+        "상품명": values["상품명"],
+        "결제금액": clean_amount(values["결제금액"]),
+        "주문번호": values["주문번호"],
+        "승인번호": values["승인번호"],
+    }
+
+
+# --- 4-3. 이지페이 메일 파싱 -----------------------------------------------
+# 이지페이 메일은 결제금액 라벨이 "상품금액"으로 표기된다.
+EASYPAY_FIELDS = ["결제일시", "상품금액", "승인번호", "상호", "상품명"]
+
+
+def _extract_easypay_control_no(body):
+    """메일 본문의 'English Receipt' 링크에서 controlNo 값을 뽑아낸다."""
+    m = re.search(r"controlNo=(\d+)[^\"'\s]*language_type=ENG", body)
+    if m:
+        return m.group(1)
+    m = re.search(r"controlNo=(\d+)", body)
+    return m.group(1) if m else None
+
+
+def fetch_easypay_order_number(control_no):
+    """이지페이 영수증 페이지(공개 페이지, 로그인 불필요)를 열어 주문번호만 읽어온다.
+    메일 속 'English Receipt' 버튼을 누르는 것과 동일한 요청이며, 결과는 이 함수를
+    호출한 곳에서만 사용하고 별도로 저장하지 않는다."""
+    try:
+        resp = requests.post(
+            "https://office.easypay.co.kr/mcht/receipt/CardReceiptAction.do",
+            data={
+                "s_method": "",
+                "controlNo": control_no,
+                "controlWay": "",
+                "tax_cd": "null",
+                "language_type": "ENG",
+            },
+            timeout=EASYPAY_RECEIPT_TIMEOUT,
+        )
+        resp.encoding = resp.apparent_encoding or "utf-8"
+        page = resp.text
+    except requests.RequestException:
+        return None
+
+    m = re.search(r"Order Number</th>\s*<td[^>]*>(.*?)</td>", page, re.DOTALL)
+    if not m:
+        return None
+    value = re.sub(r"<[^>]+>", "", m.group(1))
+    return html_lib.unescape(value).strip()
+
+
+def parse_easypay_message(body, msg_id, target_year, target_month, warn):
+    values = {label: extract_field(body, label) for label in EASYPAY_FIELDS}
+
+    dt = parse_payment_datetime(values["결제일시"])
+    if dt is None:
+        warn(f"[이지페이] 메일(id={msg_id})에서 결제일시를 해석하지 못해 건너뜁니다.")
+        return None
+    if not (dt.year == target_year and dt.month == target_month):
+        return None
+
+    control_no = _extract_easypay_control_no(body)
+    if not control_no:
+        warn(f"[이지페이] 메일(id={msg_id})에서 영수증 링크를 찾지 못해 건너뜁니다.")
+        return None
+
+    order_no = fetch_easypay_order_number(control_no)
+    if not order_no:
+        warn(f"[이지페이] 메일(id={msg_id})의 영수증 페이지에서 주문번호를 읽지 못해 건너뜁니다.")
+        return None
+
+    if not order_no.startswith(DELIVERY_ORDER_PREFIX):
+        # 쿠팡 로켓배송 등 다른 주문 (쿠팡이츠 아님, 조용히 제외)
+        return None
+
+    if not values["상품금액"]:
+        warn(f"[이지페이] 메일(id={msg_id})에서 결제금액을 찾지 못해 건너뜁니다.")
+        return None
+
+    return {
+        "_dt": dt,
+        "결제일시": values["결제일시"],
+        "PG사": PG_NAME["easypay"],
+        "상점명": values["상호"],
+        "상품명": values["상품명"],
+        "결제금액": clean_amount(values["상품금액"]),
+        "주문번호": order_no,
         "승인번호": values["승인번호"],
     }
 
@@ -229,11 +397,7 @@ def main():
     print(f"\n{year}년 {month}월 결제 내역을 조회합니다. 잠시만 기다려주세요...\n")
 
     service = get_gmail_service()
-
     start, end = month_range(year, month)
-    query = build_query(start, end)
-    ids = list_message_ids(service, query)
-    print(f"관련 메일 {len(ids)}건을 찾았습니다. 내용을 확인하는 중...\n")
 
     warnings = []
 
@@ -242,8 +406,43 @@ def main():
         print(f"  [건너뜀] {message}")
 
     rows = []
-    for msg_id in ids:
-        row = parse_message(service, msg_id, year, month, warn)
+
+    # 1) NHN KCP
+    print("[1/3] NHN KCP 메일 확인 중...")
+    kcp_ids = list_message_ids(service, build_query(KCP_SENDER, start, end, extra="subject:쿠팡이츠"))
+    print(f"  대상 메일 {len(kcp_ids)}건")
+    for msg_id in kcp_ids:
+        body = get_message_body(service, msg_id)
+        if not body:
+            warn(f"[KCP] 메일(id={msg_id})의 내용을 읽을 수 없어 건너뜁니다.")
+            continue
+        row = parse_kcp_message(body, msg_id, year, month, warn)
+        if row:
+            rows.append(row)
+
+    # 2) 나이스페이먼츠
+    print("[2/3] 나이스페이먼츠 메일 확인 중...")
+    nicepg_ids = list_message_ids(service, build_query(NICEPG_SENDER, start, end))
+    print(f"  대상 메일 {len(nicepg_ids)}건")
+    for msg_id in nicepg_ids:
+        body = get_message_body(service, msg_id)
+        if not body:
+            warn(f"[나이스페이먼츠] 메일(id={msg_id})의 내용을 읽을 수 없어 건너뜁니다.")
+            continue
+        row = parse_nicepg_message(body, msg_id, year, month, warn)
+        if row:
+            rows.append(row)
+
+    # 3) 이지페이
+    print("[3/3] 이지페이 메일 확인 중... (건별로 영수증 페이지를 추가로 확인해서 다소 시간이 걸릴 수 있습니다)")
+    easypay_ids = list_message_ids(service, build_query(EASYPAY_SENDER, start, end))
+    print(f"  대상 메일 {len(easypay_ids)}건")
+    for msg_id in easypay_ids:
+        body = get_message_body(service, msg_id)
+        if not body:
+            warn(f"[이지페이] 메일(id={msg_id})의 내용을 읽을 수 없어 건너뜁니다.")
+            continue
+        row = parse_easypay_message(body, msg_id, year, month, warn)
         if row:
             rows.append(row)
 
