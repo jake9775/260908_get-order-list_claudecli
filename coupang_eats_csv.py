@@ -63,6 +63,15 @@ PG_NAME = {
 # 쿠팡이츠 주문번호는 항상 이 문자열로 시작한다 (나이스페이먼츠 / 이지페이 판별 기준)
 DELIVERY_ORDER_PREFIX = "ROCKET_PAY_DELIVERY_"
 
+# --- 이지페이 전용 제외 기준 ---
+# 이지페이는 "English Receipt" 영수증 페이지에서 얻은 주문번호로 쿠팡이츠 여부를 가려낸다.
+# ROCKET_PAY_DELIVERY_ 로 시작하지 않는 나머지 주문번호 중에서도,
+#   - "ROCKET_PAY_" 로 시작하지만 "_DELIVERY_"가 아닌 것 (쿠팡 로켓배송 등)
+#   - "311" 로 시작하는 것 (쿠팡 일반 상품 주문)
+# 은 쿠팡이츠가 아니므로 제외한다. 그 외 주문번호(1023로 시작하는 쿠팡이츠 주문 등)는 포함한다.
+EASYPAY_GENERAL_ROCKET_PREFIX = "ROCKET_PAY_"
+EASYPAY_EXCLUDE_ORDER_PREFIX = "311"
+
 # 이지페이 영수증 페이지 요청 시 사용할 타임아웃(초)
 EASYPAY_RECEIPT_TIMEOUT = 15
 
@@ -247,7 +256,7 @@ def parse_kcp_message(body, msg_id, target_year, target_month, warn):
 
     return {
         "_dt": dt,
-        "결제일시": values["결제일시"],
+        "결제일시": dt.strftime("%Y-%m-%d %H:%M"),
         "PG사": PG_NAME["kcp"],
         "상점명": values["구매상점명"],
         "상품명": values["주문상품명"],
@@ -281,7 +290,7 @@ def parse_nicepg_message(body, msg_id, target_year, target_month, warn):
 
     return {
         "_dt": dt,
-        "결제일시": values["결제일시"],
+        "결제일시": dt.strftime("%Y-%m-%d %H:%M"),
         "PG사": PG_NAME["nicepg"],
         "상점명": values["상점명"],
         "상품명": values["상품명"],
@@ -353,8 +362,12 @@ def parse_easypay_message(body, msg_id, target_year, target_month, warn):
         warn(f"[이지페이] 메일(id={msg_id})의 영수증 페이지에서 주문번호를 읽지 못해 건너뜁니다.")
         return None
 
-    if not order_no.startswith(DELIVERY_ORDER_PREFIX):
-        # 쿠팡 로켓배송 등 다른 주문 (쿠팡이츠 아님, 조용히 제외)
+    is_general_rocket_order = order_no.startswith(
+        EASYPAY_GENERAL_ROCKET_PREFIX
+    ) and not order_no.startswith(DELIVERY_ORDER_PREFIX)
+    is_general_goods_order = order_no.startswith(EASYPAY_EXCLUDE_ORDER_PREFIX)
+    if is_general_rocket_order or is_general_goods_order:
+        # 쿠팡 로켓배송/일반 상품 주문 (쿠팡이츠 아님, 조용히 제외)
         return None
 
     if not values["상품금액"]:
@@ -363,7 +376,7 @@ def parse_easypay_message(body, msg_id, target_year, target_month, warn):
 
     return {
         "_dt": dt,
-        "결제일시": values["결제일시"],
+        "결제일시": dt.strftime("%Y-%m-%d %H:%M"),
         "PG사": PG_NAME["easypay"],
         "상점명": values["상호"],
         "상품명": values["상품명"],
@@ -373,10 +386,18 @@ def parse_easypay_message(body, msg_id, target_year, target_month, warn):
     }
 
 
+def _as_excel_text(value):
+    """엑셀이 긴 숫자 문자열(주문번호 등)을 1.02311E+18 같은 지수 표기로 자동
+    변환하지 못하도록, ="값" 형태의 텍스트 수식으로 감싼다. 메모장 등에서
+    열면 ="..." 그대로 보이지만, 엑셀에서는 원래 숫자가 그대로 표시된다."""
+    escaped = str(value).replace('"', '""')
+    return f'="{escaped}"'
+
+
 # --- 5. CSV 저장 -----------------------------------------------------------
 def save_csv(rows, year, month):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    filename = f"쿠팡이츠_{year}년{month:02d}월.csv"
+    filename = f"{year % 100:02d}{month:02d}00_쿠팡이츠결제내역_claudecli.csv"
     filepath = os.path.join(OUTPUT_DIR, filename)
 
     # UTF-8 BOM(utf-8-sig)으로 저장해야 엑셀에서 열었을 때 한글이 깨지지 않는다.
@@ -384,7 +405,10 @@ def save_csv(rows, year, month):
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
         writer.writeheader()
         for row in rows:
-            writer.writerow({col: row[col] for col in CSV_COLUMNS})
+            out = {col: row[col] for col in CSV_COLUMNS}
+            if out.get("주문번호"):
+                out["주문번호"] = _as_excel_text(out["주문번호"])
+            writer.writerow(out)
 
     return filepath
 
