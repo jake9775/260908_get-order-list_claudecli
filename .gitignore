@@ -5,6 +5,7 @@ client_secret*.json
 
 # 결제 내역이 담긴 결과물 - 개인정보이므로 커밋하지 않음
 output/*.csv
+output/*.xlsx
 
 # 파이썬 캐시
 __pycache__/

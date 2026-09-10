@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-쿠팡이츠 월별 결제 내역 CSV 자동화
+쿠팡이츠 월별 결제 내역 엑셀 자동화
 
 내가 지정한 연/월에 대해, Gmail로 온 쿠팡이츠 결제 안내 메일을 찾아서
-CSV 파일로 정리한다. 쿠팡이츠 결제는 아래 3곳의 PG(결제 대행)사 중 한
+엑셀(.xlsx) 파일로 정리한다. 쿠팡이츠 결제는 아래 3곳의 PG(결제 대행)사 중 한
 곳을 통해 메일이 온다.
 
   1. NHN KCP        (pgadmcust@kcp.co.kr)
@@ -14,9 +14,12 @@ CSV 파일로 정리한다. 쿠팡이츠 결제는 아래 3곳의 PG(결제 대�
      - 메일에 담긴 "English Receipt" 페이지의 주문번호가
        'ROCKET_PAY_DELIVERY_'로 시작하는 것
 
+결제 완료 메일뿐 아니라 취소/환불 메일도 함께 확인해서, 취소 건은 "구분"
+컬럼에 "취소"로 표시된 별도의 행으로 담는다.
+
 이 프로그램은 내 Gmail 계정에서만(읽기 전용) 메일을 읽어오고, 이지페이의
 경우 메일 속 영수증 페이지를 열어 주문번호만 추가로 확인한다. 확인한
-내용은 모두 이 컴퓨터 안에서만 처리되며, 결과는 output 폴더의 CSV
+내용은 모두 이 컴퓨터 안에서만 처리되며, 결과는 output 폴더의 엑셀
 파일로만 저장된다. 외부로 전송되거나 별도로 저장되지 않는다.
 
 사용법:
@@ -24,7 +27,6 @@ CSV 파일로 정리한다. 쿠팡이츠 결제는 아래 3곳의 PG(결제 대�
 """
 
 import base64
-import csv
 import html as html_lib
 import os
 import re
@@ -36,6 +38,9 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from openpyxl import Workbook
+from openpyxl.styles import Alignment
+from openpyxl.utils import get_column_letter
 
 # --- 경로 설정 -----------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -46,8 +51,10 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 # 지메일 읽기 전용 권한만 요청 (메일 삭제/발송 등은 하지 않음)
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
-# CSV에 실제로 저장할 컬럼 순서
-CSV_COLUMNS = ["구분", "결제일시", "PG사", "상점명", "상품명", "결제금액", "주문번호", "승인번호"]
+# 엑셀 파일에 실제로 저장할 컬럼 순서
+OUTPUT_COLUMNS = ["구분", "결제일시", "PG사", "상점명", "상품명", "결제금액", "주문번호", "승인번호"]
+# 금액과 승인번호만 오른쪽 정렬, 나머지 컬럼은 모두 왼쪽 정렬한다.
+RIGHT_ALIGN_COLUMNS = {"결제금액", "승인번호"}
 
 # 쿠팡이츠 결제가 오는 3곳의 PG사 메일 발신자 주소
 KCP_SENDER = "pgadmcust@kcp.co.kr"
@@ -223,12 +230,16 @@ def parse_payment_datetime(text):
     return None
 
 
-def clean_amount(text):
-    """'14,900 원', '32,200 원 (일시불)', '21,900원' 등을 '14,900원' 형태로 통일한다."""
+def parse_amount(text):
+    """'14,900 원', '32,200 원 (일시불)', '21,900원' 등에서 금액 숫자만 뽑아
+    정수로 반환한다. 엑셀에 실제 숫자로 저장해야 천단위 쉼표 서식과 정렬이
+    제대로 먹는다. 숫자를 찾지 못하면 None을 반환한다."""
+    if not text:
+        return None
     m = re.search(r"([\d][\d,]*)\s*원", text)
-    if m:
-        return f"{m.group(1)}원"
-    return text.strip()
+    if not m:
+        return None
+    return int(m.group(1).replace(",", ""))
 
 
 # --- 4-1. NHN KCP 메일 파싱 ------------------------------------------------
@@ -261,7 +272,8 @@ def parse_kcp_message(body, msg_id, target_year, target_month, warn):
         return None
 
     amount_text = (values["부분취소금액"] if is_cancel else "") or values["결제금액"]
-    if not amount_text:
+    amount = parse_amount(amount_text)
+    if amount is None:
         warn(f"[KCP] 메일(id={msg_id})에서 {kind}금액을 찾지 못해 건너뜁니다.")
         return None
 
@@ -272,7 +284,7 @@ def parse_kcp_message(body, msg_id, target_year, target_month, warn):
         "PG사": PG_NAME["kcp"],
         "상점명": values["구매상점명"],
         "상품명": values["주문상품명"],
-        "결제금액": clean_amount(amount_text),
+        "결제금액": amount,
         "주문번호": values["주문번호"],
         "승인번호": values["승인번호"],
     }
@@ -307,7 +319,8 @@ def parse_nicepg_message(body, msg_id, target_year, target_month, warn):
         return None
 
     amount_text = (values["취소금액"] if is_cancel else "") or values["결제금액"]
-    if not amount_text:
+    amount = parse_amount(amount_text)
+    if amount is None:
         warn(f"[나이스페이먼츠] 메일(id={msg_id})에서 {kind}금액을 찾지 못해 건너뜁니다.")
         return None
 
@@ -318,7 +331,7 @@ def parse_nicepg_message(body, msg_id, target_year, target_month, warn):
         "PG사": PG_NAME["nicepg"],
         "상점명": values["상점명"],
         "상품명": values["상품명"],
-        "결제금액": clean_amount(amount_text),
+        "결제금액": amount,
         "주문번호": values["주문번호"],
         "승인번호": values["승인번호"],
     }
@@ -400,7 +413,8 @@ def parse_easypay_message(body, msg_id, target_year, target_month, warn):
         return None
 
     amount_text = (values["취소금액"] if is_cancel else "") or values["상품금액"]
-    if not amount_text:
+    amount = parse_amount(amount_text)
+    if amount is None:
         warn(f"[이지페이] 메일(id={msg_id})에서 {kind}금액을 찾지 못해 건너뜁니다.")
         return None
 
@@ -411,42 +425,55 @@ def parse_easypay_message(body, msg_id, target_year, target_month, warn):
         "PG사": PG_NAME["easypay"],
         "상점명": values["상호"],
         "상품명": values["상품명"],
-        "결제금액": clean_amount(amount_text),
+        "결제금액": amount,
         "주문번호": order_no,
         "승인번호": values["승인번호"],
     }
 
 
-def _as_excel_text(value):
-    """엑셀이 긴 숫자 문자열(주문번호 등)을 1.02311E+18 같은 지수 표기로 자동
-    변환하지 못하도록, ="값" 형태의 텍스트 수식으로 감싼다. 메모장 등에서
-    열면 ="..." 그대로 보이지만, 엑셀에서는 원래 숫자가 그대로 표시된다."""
-    escaped = str(value).replace('"', '""')
-    return f'="{escaped}"'
-
-
-# --- 5. CSV 저장 -----------------------------------------------------------
-def save_csv(rows, year, month):
+# --- 5. 엑셀(xlsx) 저장 ------------------------------------------------------
+def save_xlsx(rows, year, month):
+    """정렬(왼쪽/오른쪽), 날짜·금액 서식, 헤더 필터가 적용된 엑셀 파일로 저장한다.
+    주문번호/승인번호는 텍스트 서식으로 고정해 긴 숫자가 지수(E) 표기로
+    바뀌지 않도록 하고, 결제일시 내림차순으로 정렬해서 담는다."""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    filename = f"{year % 100:02d}{month:02d}00_쿠팡이츠결제내역_claudecli.csv"
+    filename = f"{year % 100:02d}{month:02d}00_쿠팡이츠결제내역_claudecli.xlsx"
     filepath = os.path.join(OUTPUT_DIR, filename)
 
-    # UTF-8 BOM(utf-8-sig)으로 저장해야 엑셀에서 열었을 때 한글이 깨지지 않는다.
-    with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-        writer.writeheader()
-        for row in rows:
-            out = {col: row[col] for col in CSV_COLUMNS}
-            if out.get("주문번호"):
-                out["주문번호"] = _as_excel_text(out["주문번호"])
-            writer.writerow(out)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "결제내역"
 
+    ws.append(OUTPUT_COLUMNS)
+    for col_idx, col_name in enumerate(OUTPUT_COLUMNS, start=1):
+        ws.cell(row=1, column=col_idx).alignment = Alignment(
+            horizontal="right" if col_name in RIGHT_ALIGN_COLUMNS else "left"
+        )
+
+    for row_idx, row in enumerate(rows, start=2):
+        for col_idx, col_name in enumerate(OUTPUT_COLUMNS, start=1):
+            value = row["_dt"] if col_name == "결제일시" else row[col_name]
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.alignment = Alignment(
+                horizontal="right" if col_name in RIGHT_ALIGN_COLUMNS else "left"
+            )
+            if col_name == "결제일시":
+                cell.number_format = "yyyy-mm-dd hh:mm"
+            elif col_name == "결제금액":
+                cell.number_format = '#,##0"원"'
+            elif col_name in ("주문번호", "승인번호"):
+                cell.number_format = "@"  # 텍스트 고정 (지수 표기 방지, 앞자리 0 보존)
+
+    last_row = len(rows) + 1
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(OUTPUT_COLUMNS))}{last_row}"
+
+    wb.save(filepath)
     return filepath
 
 
 # --- 메인 ------------------------------------------------------------------
 def main():
-    print("=== 쿠팡이츠 월별 결제 내역 CSV 만들기 ===\n")
+    print("=== 쿠팡이츠 월별 결제 내역 엑셀 만들기 ===\n")
 
     year, month = ask_year_month()
     print(f"\n{year}년 {month}월 결제 내역을 조회합니다. 잠시만 기다려주세요...\n")
@@ -501,15 +528,15 @@ def main():
         if row:
             rows.append(row)
 
-    rows.sort(key=lambda r: r["_dt"])
+    rows.sort(key=lambda r: r["_dt"], reverse=True)  # 결제일시 내림차순
 
-    filepath = save_csv(rows, year, month)
+    filepath = save_xlsx(rows, year, month)
 
     print()
     if rows:
         print(f"총 {len(rows)}건을 정리해서 저장했습니다.")
     else:
-        print(f"{year}년 {month}월에는 쿠팡이츠 결제 내역이 없습니다. (항목만 있는 빈 CSV를 만들었습니다)")
+        print(f"{year}년 {month}월에는 쿠팡이츠 결제 내역이 없습니다. (항목만 있는 빈 엑셀 파일을 만들었습니다)")
     print(f"저장 위치: {filepath}")
 
     if warnings:
@@ -523,7 +550,7 @@ if __name__ == "__main__":
         print("\n취소되었습니다.")
     except PermissionError as e:
         print(f"\n[오류] 파일에 저장하지 못했습니다: {e.filename}")
-        print("→ 이 CSV 파일을 엑셀 등 다른 프로그램에서 열어놓은 상태라서 저장이 막혔을 가능성이 매우 높습니다.")
+        print("→ 이 엑셀 파일을 이미 열어놓은 상태라서 저장이 막혔을 가능성이 매우 높습니다.")
         print("   해당 파일을 닫은 뒤, 프로그램을 다시 실행해주세요.")
     except Exception as e:  # noqa: BLE001 - 비개발자용 프로그램이므로 원인을 그대로 보여준다
         print(f"\n[오류] 문제가 발생했습니다: {e}")
