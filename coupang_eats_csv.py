@@ -47,7 +47,7 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
 # CSV에 실제로 저장할 컬럼 순서
-CSV_COLUMNS = ["결제일시", "PG사", "상점명", "상품명", "결제금액", "주문번호", "승인번호"]
+CSV_COLUMNS = ["구분", "결제일시", "PG사", "상점명", "상품명", "결제금액", "주문번호", "승인번호"]
 
 # 쿠팡이츠 결제가 오는 3곳의 PG사 메일 발신자 주소
 KCP_SENDER = "pgadmcust@kcp.co.kr"
@@ -232,16 +232,26 @@ def clean_amount(text):
 
 
 # --- 4-1. NHN KCP 메일 파싱 ------------------------------------------------
-KCP_FIELDS = ["결제일시", "결제금액", "승인번호", "주문번호", "구매상점명", "주문상품명"]
+# KCP는 결제 메일과 취소 메일의 항목 이름(라벨)이 동일하고("결제일시", "결제금액" 등
+# 그대로 쓰임), 취소 메일에만 "취소요청일시"가 추가로 붙는다. 이 필드의 유무로
+# 결제/취소 메일을 구분한다. 부분취소인 경우 실제 취소 금액은 "부분취소금액"에 담긴다.
+KCP_FIELDS = [
+    "결제일시", "결제금액", "승인번호", "주문번호", "구매상점명", "주문상품명",
+    "취소요청일시", "부분취소금액",
+]
 KCP_STORE_NAMES = {"쿠팡이츠", "쿠팡이츠(레거시)"}
 
 
 def parse_kcp_message(body, msg_id, target_year, target_month, warn):
     values = {label: extract_field(body, label) for label in KCP_FIELDS}
 
-    dt = parse_payment_datetime(values["결제일시"])
+    is_cancel = bool(values["취소요청일시"])
+    kind = "취소" if is_cancel else "결제"
+    dt_text = values["취소요청일시"] if is_cancel else values["결제일시"]
+
+    dt = parse_payment_datetime(dt_text)
     if dt is None:
-        warn(f"[KCP] 메일(id={msg_id})에서 결제일시를 해석하지 못해 건너뜁니다.")
+        warn(f"[KCP] 메일(id={msg_id})에서 {kind}일시를 해석하지 못해 건너뜁니다.")
         return None
     if not (dt.year == target_year and dt.month == target_month):
         return None
@@ -250,32 +260,44 @@ def parse_kcp_message(body, msg_id, target_year, target_month, warn):
         # 쿠팡이츠가 아닌 다른 KCP 결제 메일 (해당사항 없음, 조용히 제외)
         return None
 
-    if not values["결제금액"]:
-        warn(f"[KCP] 메일(id={msg_id})에서 결제금액을 찾지 못해 건너뜁니다.")
+    amount_text = (values["부분취소금액"] if is_cancel else "") or values["결제금액"]
+    if not amount_text:
+        warn(f"[KCP] 메일(id={msg_id})에서 {kind}금액을 찾지 못해 건너뜁니다.")
         return None
 
     return {
         "_dt": dt,
+        "구분": kind,
         "결제일시": dt.strftime("%Y-%m-%d %H:%M"),
         "PG사": PG_NAME["kcp"],
         "상점명": values["구매상점명"],
         "상품명": values["주문상품명"],
-        "결제금액": clean_amount(values["결제금액"]),
+        "결제금액": clean_amount(amount_text),
         "주문번호": values["주문번호"],
         "승인번호": values["승인번호"],
     }
 
 
 # --- 4-2. 나이스페이먼츠 메일 파싱 -----------------------------------------
-NICEPG_FIELDS = ["결제일시", "결제금액", "승인번호", "주문번호", "상점명", "상품명"]
+# 나이스페이먼츠도 취소 메일에 "취소요청일시"가 추가로 붙는다. 결제금액 라벨은
+# 취소 메일에서는 "결제 금액"(띄어쓰기 있음)으로 바뀌어 못 찾으므로, 취소 메일에만
+# 있는 "취소금액"(붙여쓰기) 라벨을 대신 사용한다.
+NICEPG_FIELDS = [
+    "결제일시", "결제금액", "승인번호", "주문번호", "상점명", "상품명",
+    "취소요청일시", "취소금액",
+]
 
 
 def parse_nicepg_message(body, msg_id, target_year, target_month, warn):
     values = {label: extract_field(body, label) for label in NICEPG_FIELDS}
 
-    dt = parse_payment_datetime(values["결제일시"])
+    is_cancel = bool(values["취소요청일시"])
+    kind = "취소" if is_cancel else "결제"
+    dt_text = values["취소요청일시"] if is_cancel else values["결제일시"]
+
+    dt = parse_payment_datetime(dt_text)
     if dt is None:
-        warn(f"[나이스페이먼츠] 메일(id={msg_id})에서 결제일시를 해석하지 못해 건너뜁니다.")
+        warn(f"[나이스페이먼츠] 메일(id={msg_id})에서 {kind}일시를 해석하지 못해 건너뜁니다.")
         return None
     if not (dt.year == target_year and dt.month == target_month):
         return None
@@ -284,17 +306,19 @@ def parse_nicepg_message(body, msg_id, target_year, target_month, warn):
         # 쿠팡 로켓배송 등 다른 주문 (쿠팡이츠 아님, 조용히 제외)
         return None
 
-    if not values["결제금액"]:
-        warn(f"[나이스페이먼츠] 메일(id={msg_id})에서 결제금액을 찾지 못해 건너뜁니다.")
+    amount_text = (values["취소금액"] if is_cancel else "") or values["결제금액"]
+    if not amount_text:
+        warn(f"[나이스페이먼츠] 메일(id={msg_id})에서 {kind}금액을 찾지 못해 건너뜁니다.")
         return None
 
     return {
         "_dt": dt,
+        "구분": kind,
         "결제일시": dt.strftime("%Y-%m-%d %H:%M"),
         "PG사": PG_NAME["nicepg"],
         "상점명": values["상점명"],
         "상품명": values["상품명"],
-        "결제금액": clean_amount(values["결제금액"]),
+        "결제금액": clean_amount(amount_text),
         "주문번호": values["주문번호"],
         "승인번호": values["승인번호"],
     }
@@ -302,7 +326,8 @@ def parse_nicepg_message(body, msg_id, target_year, target_month, warn):
 
 # --- 4-3. 이지페이 메일 파싱 -----------------------------------------------
 # 이지페이 메일은 결제금액 라벨이 "상품금액"으로 표기된다.
-EASYPAY_FIELDS = ["결제일시", "상품금액", "승인번호", "상호", "상품명"]
+# 취소 메일은 "결제일시" 대신 "취소일시"가 쓰이고, 이번 취소분 금액은 "취소금액"에 담긴다.
+EASYPAY_FIELDS = ["결제일시", "상품금액", "승인번호", "상호", "상품명", "취소일시", "취소금액"]
 
 
 def _extract_easypay_control_no(body):
@@ -345,9 +370,13 @@ def fetch_easypay_order_number(control_no):
 def parse_easypay_message(body, msg_id, target_year, target_month, warn):
     values = {label: extract_field(body, label) for label in EASYPAY_FIELDS}
 
-    dt = parse_payment_datetime(values["결제일시"])
+    is_cancel = bool(values["취소일시"])
+    kind = "취소" if is_cancel else "결제"
+    dt_text = values["취소일시"] if is_cancel else values["결제일시"]
+
+    dt = parse_payment_datetime(dt_text)
     if dt is None:
-        warn(f"[이지페이] 메일(id={msg_id})에서 결제일시를 해석하지 못해 건너뜁니다.")
+        warn(f"[이지페이] 메일(id={msg_id})에서 {kind}일시를 해석하지 못해 건너뜁니다.")
         return None
     if not (dt.year == target_year and dt.month == target_month):
         return None
@@ -370,17 +399,19 @@ def parse_easypay_message(body, msg_id, target_year, target_month, warn):
         # 쿠팡 로켓배송/일반 상품 주문 (쿠팡이츠 아님, 조용히 제외)
         return None
 
-    if not values["상품금액"]:
-        warn(f"[이지페이] 메일(id={msg_id})에서 결제금액을 찾지 못해 건너뜁니다.")
+    amount_text = (values["취소금액"] if is_cancel else "") or values["상품금액"]
+    if not amount_text:
+        warn(f"[이지페이] 메일(id={msg_id})에서 {kind}금액을 찾지 못해 건너뜁니다.")
         return None
 
     return {
         "_dt": dt,
+        "구분": kind,
         "결제일시": dt.strftime("%Y-%m-%d %H:%M"),
         "PG사": PG_NAME["easypay"],
         "상점명": values["상호"],
         "상품명": values["상품명"],
-        "결제금액": clean_amount(values["상품금액"]),
+        "결제금액": clean_amount(amount_text),
         "주문번호": order_no,
         "승인번호": values["승인번호"],
     }
@@ -490,6 +521,10 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\n취소되었습니다.")
+    except PermissionError as e:
+        print(f"\n[오류] 파일에 저장하지 못했습니다: {e.filename}")
+        print("→ 이 CSV 파일을 엑셀 등 다른 프로그램에서 열어놓은 상태라서 저장이 막혔을 가능성이 매우 높습니다.")
+        print("   해당 파일을 닫은 뒤, 프로그램을 다시 실행해주세요.")
     except Exception as e:  # noqa: BLE001 - 비개발자용 프로그램이므로 원인을 그대로 보여준다
         print(f"\n[오류] 문제가 발생했습니다: {e}")
     finally:
