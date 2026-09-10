@@ -52,7 +52,7 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
 # 엑셀 파일에 실제로 저장할 컬럼 순서
-OUTPUT_COLUMNS = ["구분", "결제일시", "PG사", "상점명", "상품명", "결제금액", "주문번호", "승인번호"]
+OUTPUT_COLUMNS = ["결제일시", "PG사", "상점명", "상품명", "결제금액", "구분", "주문번호", "승인번호"]
 # 금액과 승인번호만 오른쪽 정렬, 나머지 컬럼은 모두 왼쪽 정렬한다.
 RIGHT_ALIGN_COLUMNS = {"결제금액", "승인번호"}
 
@@ -434,8 +434,11 @@ def parse_easypay_message(body, msg_id, target_year, target_month, warn):
 # --- 5. 엑셀(xlsx) 저장 ------------------------------------------------------
 def save_xlsx(rows, year, month):
     """정렬(왼쪽/오른쪽), 날짜·금액 서식, 헤더 필터가 적용된 엑셀 파일로 저장한다.
-    주문번호/승인번호는 텍스트 서식으로 고정해 긴 숫자가 지수(E) 표기로
-    바뀌지 않도록 하고, 결제일시 내림차순으로 정렬해서 담는다."""
+    주문번호는 20자리에 육박해 숫자로 저장하면 정밀도가 깨지므로 텍스트로
+    고정한다. 승인번호는 8자리 고정 숫자코드라 실제 숫자로 저장하되, 0으로
+    시작하는 값(예: "01875324")은 자릿수만큼 0을 채우는 서식("00000000")을
+    입혀서 앞자리 0이 화면에서 사라지지 않게 한다. 결제일시는 내림차순으로
+    정렬해서 담는다."""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     filename = f"{year % 100:02d}{month:02d}00_쿠팡이츠결제내역_claudecli.xlsx"
     filepath = os.path.join(OUTPUT_DIR, filename)
@@ -452,7 +455,14 @@ def save_xlsx(rows, year, month):
 
     for row_idx, row in enumerate(rows, start=2):
         for col_idx, col_name in enumerate(OUTPUT_COLUMNS, start=1):
-            value = row["_dt"] if col_name == "결제일시" else row[col_name]
+            raw_approval = row["승인번호"]
+            if col_name == "결제일시":
+                value = row["_dt"]
+            elif col_name == "승인번호" and raw_approval.isdigit():
+                value = int(raw_approval)
+            else:
+                value = row[col_name]
+
             cell = ws.cell(row=row_idx, column=col_idx, value=value)
             cell.alignment = Alignment(
                 horizontal="right" if col_name in RIGHT_ALIGN_COLUMNS else "left"
@@ -461,8 +471,10 @@ def save_xlsx(rows, year, month):
                 cell.number_format = "yyyy-mm-dd hh:mm"
             elif col_name == "결제금액":
                 cell.number_format = '#,##0"원"'
-            elif col_name in ("주문번호", "승인번호"):
-                cell.number_format = "@"  # 텍스트 고정 (지수 표기 방지, 앞자리 0 보존)
+            elif col_name == "주문번호":
+                cell.number_format = "@"  # 텍스트 고정 (지수 표기 방지)
+            elif col_name == "승인번호":
+                cell.number_format = "0" * len(raw_approval) if raw_approval.isdigit() else "@"
 
     last_row = len(rows) + 1
     ws.auto_filter.ref = f"A1:{get_column_letter(len(OUTPUT_COLUMNS))}{last_row}"
