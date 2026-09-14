@@ -23,7 +23,7 @@
 파일로만 저장된다. 외부로 전송되거나 별도로 저장되지 않는다.
 
 사용법:
-    run.bat 을 더블클릭하거나, 터미널에서 `python coupang_eats_csv.py` 실행
+    run_coupang_eats.bat 을 더블클릭하거나, 터미널에서 `python coupang_eats_csv.py` 실행
 """
 
 import base64
