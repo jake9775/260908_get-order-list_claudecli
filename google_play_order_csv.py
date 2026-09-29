@@ -9,6 +9,14 @@
   A. 결제 영수증  - 제목: "Google Play 주문 영수증(YYYY. M. D.)"
   B. 취소 영수증  - 제목: "Google Play 주문 취소 영수증(YYYY. M. D.)"
 
+추가로 Google 결제 센터(payments-noreply@google.com)에서 온, 제목에 "결제"가
+들어간 메일도 검색해서 아래 1가지를 처리한다.
+
+  C. 결제 완료    - 제목: "Google Cloud Platform & APIs: 결제 완료" 등
+                    본문에 시각이 없어 결제일시는 "메일 수신 시각"으로 기록한다.
+                    같은 검색에 걸리는 "결제 수단 업데이트됨", "결제 계정 폐쇄
+                    알림"은 금액이 없는 안내 메일이라 조용히 제외한다.
+
 아래 메일들은 이번 버전에서 일부러 처리하지 않는다 (다음 버전 과제):
   - "Google Play 환불이 승인됨" - 문장형 별도 환불 메일. 위 A/B와 본문 구조가
     완전히 달라서(표 형태가 아님, 주문 날짜/결제 방법 항목 자체가 없음) 별도
@@ -62,6 +70,13 @@ GOOGLE_PLAY_SENDER = "googleplay-noreply@google.com"
 # 걸리고, "환불이 승인됨"이나 "정기 결제가 취소됩니다" 같은 다른 형식의
 # 메일은 자동으로 제외된다.
 SUBJECT_FILTER = "subject:영수증"
+
+# Google 결제 센터(payments-noreply)는 Google Cloud 등 Play 외 서비스의 결제
+# 완료 메일을 보낸다. 제목에 "결제"가 들어간 메일을 검색하되, 같은 조건에
+# "결제 수단 업데이트됨"·"결제 계정 폐쇄 알림"처럼 금액이 없는 안내 메일도
+# 걸리므로, 본문에 "…의 결제 금액이 …에 적용" 문장이 있는 메일만 담는다.
+GOOGLE_PAYMENTS_SENDER = "payments-noreply@google.com"
+PAYMENTS_SUBJECT_FILTER = "subject:결제"
 
 # 영어 날짜 형식(예전 메일)을 해석할 때 쓰는 월 이름 표
 MONTH_NAMES = {
@@ -125,12 +140,12 @@ def month_range(year, month):
     return start, end
 
 
-def build_query(start, end):
+def build_query(start, end, sender, subject_filter):
     # 시간대 경계에서 메일이 하루 밀리는 경우를 대비해 앞뒤로 하루씩 여유를 두고 검색한다.
-    # 실제 대상 월인지는 메일 본문의 주문 날짜를 파싱해 다시 한번 정확히 걸러낸다.
+    # 실제 대상 월인지는 메일 날짜를 다시 확인해 한번 더 정확히 걸러낸다.
     q_start = (start - timedelta(days=1)).strftime("%Y/%m/%d")
     q_end = (end + timedelta(days=1)).strftime("%Y/%m/%d")
-    return f"from:{GOOGLE_PLAY_SENDER} after:{q_start} before:{q_end} {SUBJECT_FILTER}"
+    return f"from:{sender} after:{q_start} before:{q_end} {subject_filter}"
 
 
 def list_message_ids(service, query):
@@ -173,7 +188,9 @@ def _find_part(payload, mime_type):
 def get_message(service, msg_id):
     """Google Play 영수증 메일은 plain text 본문이 "주문 번호:" 같은 라벨
     형태로 깔끔하게 정리되어 있어서, HTML보다 text/plain을 우선 사용한다.
-    구분(결제/취소) 판단에 제목도 필요해서 제목과 본문을 함께 반환한다."""
+    구분(결제/취소) 판단에 제목도 필요해서 제목과 본문을 함께 반환한다.
+    결제 센터 메일은 본문에 시각이 없어서, 메일 수신 시각(이 PC 현지시간)도
+    함께 반환한다."""
     msg = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
     payload = msg.get("payload", {})
     headers = {h["name"]: h["value"] for h in payload.get("headers", [])}
@@ -181,7 +198,8 @@ def get_message(service, msg_id):
     body = _find_part(payload, "text/plain")
     if body is None:
         body = _find_part(payload, "text/html")
-    return subject, body or ""
+    received_dt = datetime.fromtimestamp(int(msg["internalDate"]) / 1000)
+    return subject, body or "", received_dt
 
 
 # --- 4. 메일 본문에서 항목 추출 -------------------------------------------
@@ -330,6 +348,40 @@ def parse_google_play_message(subject, body, msg_id, target_year, target_month, 
     }
 
 
+def parse_google_payments_message(received_dt, body, target_year, target_month):
+    """결제 센터(payments-noreply) "결제 완료" 메일. 본문 예:
+        2026년 9월 15일에 ₩10,000의 결제 금액이 Google Cloud Platform & APIs에
+        적용되었습니다.
+    본문에 시각·주문번호·결제방법·상품명이 없어서, 결제일시는 메일 수신
+    시각을 쓰고 나머지는 비워둔다. 월 판별도 수신 시각 기준으로 해서 엑셀의
+    결제일시와 조회 월이 항상 일치하게 한다.
+    이 문장이 없는 메일(결제 수단 업데이트, 계정 폐쇄 알림 등)은 돈이 움직인
+    메일이 아니므로 경고 없이 제외한다."""
+    if not (received_dt.year == target_year and received_dt.month == target_month):
+        return None
+
+    # 통화 기호 표기 오류에 대응하는 이유는 extract_item_and_amount 참고.
+    m = re.search(
+        r"[^\d\s]?(\d[\d,]*)의\s*결제\s*금액이\s*(.+?)에\s*적용",
+        body,
+        re.DOTALL,
+    )
+    if not m:
+        return None
+
+    return {
+        "_dt": received_dt,
+        "구분": "결제",
+        "결제일시": received_dt.strftime("%Y-%m-%d %H:%M"),
+        "PG사": "Google Payments",
+        "상점명": re.sub(r"\s+", " ", m.group(2)).strip(),  # 줄바꿈된 서비스명을 한 줄로
+        "상품명": "",
+        "결제금액": int(m.group(1).replace(",", "")),
+        "주문번호": "",
+        "결제방법": "",
+    }
+
+
 # --- 5. 엑셀(xlsx) 저장 ------------------------------------------------------
 def save_xlsx(rows, year, month):
     """정렬(왼쪽/오른쪽), 날짜·금액 서식, 헤더 필터가 적용된 엑셀 파일로 저장한다.
@@ -388,15 +440,27 @@ def main():
 
     rows = []
 
-    query = build_query(start, end)
+    query = build_query(start, end, GOOGLE_PLAY_SENDER, SUBJECT_FILTER)
     ids = list_message_ids(service, query)
-    print(f"대상 메일 {len(ids)}건")
+    print(f"Google Play 대상 메일 {len(ids)}건")
     for msg_id in ids:
-        subject, body = get_message(service, msg_id)
+        subject, body, _ = get_message(service, msg_id)
         if not body:
             warn(f"메일(id={msg_id})의 내용을 읽을 수 없어 건너뜁니다.")
             continue
         row = parse_google_play_message(subject, body, msg_id, year, month, warn)
+        if row:
+            rows.append(row)
+
+    query = build_query(start, end, GOOGLE_PAYMENTS_SENDER, PAYMENTS_SUBJECT_FILTER)
+    ids = list_message_ids(service, query)
+    print(f"Google 결제 센터 대상 메일 {len(ids)}건")
+    for msg_id in ids:
+        _, body, received_dt = get_message(service, msg_id)
+        if not body:
+            warn(f"메일(id={msg_id})의 내용을 읽을 수 없어 건너뜁니다.")
+            continue
+        row = parse_google_payments_message(received_dt, body, year, month)
         if row:
             rows.append(row)
 
