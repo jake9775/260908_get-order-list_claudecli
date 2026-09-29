@@ -49,11 +49,18 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment
 from openpyxl.utils import get_column_letter
 
+import mapping_rules
+
 # --- 경로 설정 -----------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CREDENTIALS_PATH = os.path.join(BASE_DIR, "credentials.json")
 TOKEN_PATH = os.path.join(BASE_DIR, "token.json")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
+RULES_PATH = os.path.join(BASE_DIR, "rules", "memo_mapping_구글플레이.csv")
+
+# 상품명 규칙 파일에서 조건으로 쓸 수 있는 칸 (작성법은 mapping_rules.py 참고)
+RULE_CONDITION_COLUMNS = ("PG사", "상점명", "결제금액", "구분", "주문번호", "결제방법")
+RULE_NUMBER_COLUMNS = ("결제금액",)
 
 # 지메일 읽기 전용 권한만 요청 (메일 삭제/발송 등은 하지 않음)
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
@@ -465,6 +472,13 @@ def main():
             rows.append(row)
 
     rows.sort(key=lambda r: r["_dt"], reverse=True)  # 결제일시 내림차순
+
+    # 상품명이 빈칸인 행(예: 결제 센터 메일)에 규칙 파일의 상품명을 채운다.
+    mapping_rules.ensure_template(RULES_PATH, RULE_CONDITION_COLUMNS + ("상품명",))
+    rules = mapping_rules.load(RULES_PATH, RULE_CONDITION_COLUMNS, RULE_NUMBER_COLUMNS)
+    filled = mapping_rules.apply(rows, rules, RULE_NUMBER_COLUMNS)
+    if filled:
+        print(f"상품명 규칙으로 {filled}건을 채웠습니다.")
 
     filepath = save_xlsx(rows, year, month)
 
