@@ -1,0 +1,20 @@
+{
+  "extraKnownMarketplaces": {
+    "claude-community": {
+      "source": {
+        "source": "github",
+        "repo": "anthropics/claude-plugins-community"
+      }
+    },
+    "omc": {
+      "source": {
+        "source": "github",
+        "repo": "Yeachan-Heo/oh-my-claudecode"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "eli5@claude-community": true,
+    "oh-my-claudecode@omc": true
+  }
+}
