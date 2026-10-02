@@ -11,7 +11,7 @@
   - 결제금액은 "결제 정보"의 Smile Pay + 스마일캐시(·머니) 합계 (실제 결제액)
   - 상품명은 주문 상품 전부를 " / "로 이어서 적는다 (옵션은 적지 않음)
 
-취소/환불 메일은 처리하지 않는다. 같은 주문번호가 이미 처리됐으면 중복으로 보고 제외한다.
+취소/환불 메일은 처리하지 않는다. 메일 한 통당 한 줄로 저장하며, 주문번호 중복은 확인하지 않는다.
 
 이 프로그램은 내 Gmail 계정에서만(읽기 전용) 메일을 읽어오고, 확인한 내용은
 모두 이 컴퓨터 안에서만 처리되며, 결과는 output 폴더의 엑셀 파일로만
@@ -126,7 +126,7 @@ def extract_payment(text):
     return total, " + ".join(methods)
 
 
-def parse_auction_message(subject, html, received, msg_id, target_year, target_month, seen_orders, warn):
+def parse_auction_message(subject, html, received, msg_id, target_year, target_month, warn):
     # 주문 안내가 아닌 메일은 조용히 제외한다.
     if "주문" not in subject or "감사합니다" not in subject:
         return None
@@ -139,14 +139,11 @@ def parse_auction_message(subject, html, received, msg_id, target_year, target_m
     if not orders:
         warn(f"메일(id={msg_id})에서 주문번호를 찾지 못해 건너뜁니다.")
         return None
-    if all(o in seen_orders for o in orders):
-        return None  # 이미 처리한 주문번호
     payment = extract_payment(text)
     if payment is None:
         warn(f"메일(id={msg_id}, 주문번호 {orders[0]})에서 결제금액을 찾지 못해 건너뜁니다.")
         return None
     amount, method = payment
-    seen_orders.update(orders)
 
     return {
         "_dt": received,
@@ -217,7 +214,6 @@ def main():
         print(f"  [건너뜀] {message}")
 
     rows = []
-    seen_orders = set()
     ids = list_message_ids(service, build_query(start, end, AUCTION_SENDER, SUBJECT_FILTER))
     print(f"옥션 대상 메일 {len(ids)}건")
     for msg_id in ids:
@@ -225,7 +221,7 @@ def main():
         if not html:
             warn(f"메일(id={msg_id})의 내용을 읽을 수 없어 건너뜁니다.")
             continue
-        row = parse_auction_message(subject, html, received, msg_id, year, month, seen_orders, warn)
+        row = parse_auction_message(subject, html, received, msg_id, year, month, warn)
         if row:
             rows.append(row)
 

@@ -117,7 +117,7 @@ def extract_payment(lines):
     return amount, " + ".join(methods)
 
 
-def parse_st11_message(subject, html, received, msg_id, target_year, target_month, seen_orders, warn):
+def parse_st11_message(subject, html, received, msg_id, target_year, target_month, warn):
     # 결제도 취소도 아닌 안내 메일은 조용히 제외한다.
     if "정상 결제되었습니다" in subject:
         kind = "결제"
@@ -135,16 +135,12 @@ def parse_st11_message(subject, html, received, msg_id, target_year, target_mont
         warn(f"메일(id={msg_id})에서 주문번호를 찾지 못해 건너뜁니다.")
         return None
     order_numbers = [o[0] for o in orders]
-    key = [(kind, n) for n in order_numbers]
-    if all(k in seen_orders for k in key):
-        return None  # 이미 처리한 주문번호
 
     payment = extract_payment(lines)
     if payment is None:
         warn(f"메일(id={msg_id}, 주문번호 {order_numbers[0]}, {kind})에서 결제금액을 찾지 못해 건너뜁니다.")
         return None
     amount, method = payment
-    seen_orders.update(key)
 
     names = [name for _, product_names in orders for name in product_names]
     return {
@@ -216,7 +212,6 @@ def main():
         print(f"  [건너뜀] {message}")
 
     rows = []
-    seen_orders = set()
     ids = list_message_ids(service, build_query(start, end, ST11_SENDER, SUBJECT_FILTER))
     print(f"11번가 대상 메일 {len(ids)}건")
     for msg_id in ids:
@@ -224,7 +219,7 @@ def main():
         if not html:
             warn(f"메일(id={msg_id})의 내용을 읽을 수 없어 건너뜁니다.")
             continue
-        row = parse_st11_message(subject, html, received, msg_id, year, month, seen_orders, warn)
+        row = parse_st11_message(subject, html, received, msg_id, year, month, warn)
         if row:
             rows.append(row)
 
