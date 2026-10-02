@@ -13,3 +13,6 @@ __pycache__/
 
 # Claude Code(oh-my-claudecode) 내부 세션/작업 상태 - 프로젝트 코드와 무관
 .omc/
+
+# Claude Code(oh-my-codex) 로그/세션 상태 - 프로젝트 코드와 무관
+.omx/
