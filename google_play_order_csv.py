@@ -17,6 +17,12 @@
                     같은 검색에 걸리는 "결제 수단 업데이트됨", "결제 계정 폐쇄
                     알림"은 금액이 없는 안내 메일이라 조용히 제외한다.
 
+결제금액은 영수증 합계가 아니라 "실결제금액"(카드 등으로 실제 나간 돈)이다.
+Google Play 잔액은 포인트로 미리 충전한 돈이라 현금 지출이 아니므로 뺀다.
+  - 카드 단독 결제          → 합계 전액
+  - 잔액 단독 결제          → 0원
+  - 잔액 + 카드 혼합 결제   → 카드로 나간 금액만 (결제방법 칸에 두 수단과 금액 표시)
+
 아래 메일들은 이번 버전에서 일부러 처리하지 않는다 (다음 버전 과제):
   - "Google Play 환불이 승인됨" - 문장형 별도 환불 메일. 위 A/B와 본문 구조가
     완전히 달라서(표 형태가 아님, 주문 날짜/결제 방법 항목 자체가 없음) 별도
@@ -273,9 +279,62 @@ def extract_total_amount(body):
     return int(m.group(1).replace(",", "")) if m else None
 
 
+PAYMENT_LABEL_RE = re.compile(r"(?:결제\s*(?:방법|수단)|Payment\s*method):[ \t]*\r?\n")
+# 결제수단 한 줄: "하나-7824" / "Google Play 잔액" / (혼합 결제) "하나-7824: ₩13,900"
+# 금액 앞 통화 기호는 오표기("a")가 있을 수 있어 글자 하나를 건너뛴다.
+PAYMENT_ENTRY_RE = re.compile(
+    r"^(Google Play 잔액|[가-힣A-Za-z]+-\d+)(?::\s*[^\d\s]?(\d[\d,]*))?\s*$"
+)
+BALANCE_NAME = "Google Play 잔액"
+
+
+def extract_payment_entries(body):
+    """결제수단 칸의 줄들을 [(이름, 금액 또는 None), ...]으로 뽑는다.
+    카드 단독 결제는 "하나-7824" 한 줄, 잔액+카드 혼합 결제는 라벨이
+    "결제 수단:"이고 "Google Play 잔액: ₩15,000" / "하나-7824: ₩13,900"처럼
+    줄마다 금액이 붙는다. 수단처럼 보이지 않는 줄(안내 문구 등)을 만나면 멈춘다."""
+    m = PAYMENT_LABEL_RE.search(body)
+    if not m:
+        return []
+    entries = []
+    for line in body[m.end():].splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        e = PAYMENT_ENTRY_RE.match(line)
+        if not e:
+            break
+        amount = int(e.group(2).replace(",", "")) if e.group(2) else None
+        entries.append((e.group(1), amount))
+    return entries
+
+
 def extract_payment_method(body):
-    m = re.search(r"(?:결제\s*방법|Payment\s*method):\s*\n+\s*(\S[^\n]*)", body)
+    entries = extract_payment_entries(body)
+    if entries:
+        return " + ".join(
+            name if amount is None else f"{name} ₩{amount:,}" for name, amount in entries
+        )
+    # 낯선 형식이면 라벨 다음 첫 줄을 그대로 쓴다.
+    m = re.search(r"(?:결제\s*(?:방법|수단)|Payment\s*method):\s*\n+\s*(\S[^\n]*)", body)
     return m.group(1).strip() if m else ""
+
+
+def extract_cash_amount(body, total):
+    """실결제금액 = 카드 등으로 실제 나간 돈. Google Play 잔액은 포인트로 미리
+    충전해 둔 돈이라 현금 지출이 아니므로 뺀다.
+      - 잔액 단독 결제            → 0
+      - 잔액 + 카드 혼합 결제     → 카드 줄 금액의 합
+      - 그 외(카드 단독, 낯선 형식) → 영수증 합계 그대로"""
+    entries = extract_payment_entries(body)
+    if not entries:
+        return total
+    if all(name == BALANCE_NAME for name, _ in entries):
+        return 0
+    non_balance = [(n, a) for n, a in entries if n != BALANCE_NAME]
+    if len(entries) == 1 or any(a is None for _, a in non_balance):
+        return total
+    return sum(a for _, a in non_balance)
 
 
 def parse_order_datetime(text):
@@ -349,7 +408,7 @@ def parse_google_play_message(subject, body, msg_id, target_year, target_month, 
         "PG사": "Google Play",
         "상점명": extract_store_name(body),
         "상품명": item_name,
-        "결제금액": amount,
+        "결제금액": extract_cash_amount(body, amount),
         "주문번호": extract_order_number(body),
         "결제방법": extract_payment_method(body),
     }
