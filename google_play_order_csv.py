@@ -234,6 +234,8 @@ def extract_store_name(body):
         r"Google Play를 통한\s*(.+?)\s*구독이\s*갱신",
         r"Google Play에서\s*(.+?)의\s*구독이\s*갱신",
         r"Google Play에서\s*(.+?)의\s*정기\s*결제를\s*시작하셨습니다",  # 신규 구독 시작
+        r"Google Play에서\s*(.+?)의\s*정기\s*구독을\s*구매하셨습니다",  # 신규 구독 구매(2025. 2~3월형)
+        r"Google Play에서\s*(.+?)의\s*정기\s*결제\s*요금제를\s*구매하셨습니다",  # 신규 구독 구매(요금제형)
         r"Google Play에서\s*(.+?)의\s*무료\s*체험",  # 무료 체험 시작
         r"Google Play\s+(.+?)\s*구독\s*구매를\s*업데이트했습니다",  # 구독(결제수단) 업데이트
         # 예전 영어 형식 메일
@@ -340,8 +342,10 @@ def extract_cash_amount(body, total):
 def parse_order_datetime(text):
     """구글플레이 메일은 한글 형식(최근)과 영어 형식(예전) 둘 다 쓰인다."""
     # 한글: 2026. 9. 11. 오후 12시 50분 13초 GMT+9
+    # (2025. 11월 중순~2026. 4월 초 메일은 "2026. 4. 2. PM 1시 21분 35초"처럼
+    # 오전/오후 자리에 AM/PM이 찍혀 있어서 둘 다 받는다.)
     m = re.search(
-        r"(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\.\s*(오전|오후)\s*"
+        r"(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\.\s*(오전|오후|AM|PM)\s*"
         r"(\d{1,2})시\s*(\d{1,2})분\s*(\d{1,2})초",
         text,
     )
@@ -349,9 +353,9 @@ def parse_order_datetime(text):
         year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
         meridiem = m.group(4)
         hour, minute, second = int(m.group(5)), int(m.group(6)), int(m.group(7))
-        if meridiem == "오후" and hour != 12:
+        if meridiem in ("오후", "PM") and hour != 12:
             hour += 12
-        if meridiem == "오전" and hour == 12:
+        if meridiem in ("오전", "AM") and hour == 12:
             hour = 0
         try:
             return datetime(year, month, day, hour, minute, second)
